@@ -33,13 +33,38 @@ def font(size=24):
         return ImageFont.load_default()
 
 # ---------------------------
-# Session state
+# Session state + compatibility shim
 # ---------------------------
-if "alliances" not in st.session_state:
-    # dict[frozenset({A,B})] -> list[int] indices (ascending)
-    st.session_state.alliances = defaultdict(list)
-if "next_idx" not in st.session_state:
-    st.session_state.next_idx = 1
+def _init_state():
+    # New canonical shape: defaultdict(list) mapping frozenset({A,B}) -> [indices]
+    if "alliances" not in st.session_state:
+        st.session_state.alliances = defaultdict(list)
+    else:
+        # If an older app version stored alliances as a list of tuples,
+        # migrate it to the new dict form so .items() works.
+        if isinstance(st.session_state.alliances, list):
+            migrated = defaultdict(list)
+            for tup in st.session_state.alliances:
+                # Expect (a,b,idx); ignore malformed items gracefully
+                if isinstance(tup, (tuple, list)) and len(tup) == 3:
+                    a, b, idx = tup
+                    migrated[frozenset({a, b})].append(int(idx))
+            st.session_state.alliances = migrated
+
+    # Unified counter key
+    if "next_idx" not in st.session_state:
+        # Support old 'next_index' if present
+        if "next_index" in st.session_state and isinstance(st.session_state.next_index, int):
+            st.session_state.next_idx = st.session_state.next_index
+        else:
+            # derive from existing alliances
+            max_idx = 0
+            for lst in st.session_state.alliances.values():
+                if lst:
+                    max_idx = max(max_idx, max(lst))
+            st.session_state.next_idx = max_idx + 1
+
+_init_state()
 
 # ---------------------------
 # Helpers
@@ -60,7 +85,7 @@ def draw_palette_row():
     return img
 
 def connected_components(edges):
-    """Return list of sets (nodes) for each connected component."""
+    """Return list of sets (nodes) for each connected component and adjacency map."""
     adj = defaultdict(set)
     nodes = set()
     for fs in edges:
@@ -72,11 +97,9 @@ def connected_components(edges):
     for n in nodes:
         if n in seen: continue
         comp = set()
-        q = deque([n])
-        seen.add(n)
+        q = deque([n]); seen.add(n)
         while q:
-            u = q.popleft()
-            comp.add(u)
+            u = q.popleft(); comp.add(u)
             for v in adj[u]:
                 if v not in seen:
                     seen.add(v); q.append(v)
@@ -84,29 +107,24 @@ def connected_components(edges):
     return comps, adj
 
 def linearize_component(nodes, adj):
-    """Produce a simple left-to-right order for the component to keep many allied pairs adjacent.
-       Prefer a path starting at a degree-1 node; fallback arbitrary BFS."""
+    """Simple left-to-right order. Prefer a path starting at degree-1 node."""
     if not nodes:
         return []
     deg1 = [n for n in nodes if len(adj[n]) == 1]
     start = deg1[0] if deg1 else next(iter(nodes))
-    order = []
-    seen = set()
+    order, seen = [], set()
     cur = start
-    # greedy walk preferring unseen neighbors, then fallback to BFS for remaining
     while cur is not None:
         order.append(cur); seen.add(cur)
         nxt = next((v for v in adj[cur] if v not in seen), None)
         cur = nxt
-    # add any remaining (branches) via simple append
     for n in nodes:
         if n not in seen:
             order.append(n); seen.add(n)
     return order
 
 def draw_component_row(order, alliance_map):
-    """Draw a single connected component row with squares for parties in 'order'.
-       Draw strips only for alliances between adjacent squares in this order."""
+    """Draw one connected component as a row of squares; draw strips for adjacent allied pairs."""
     n = len(order)
     if n == 0:
         return Image.new("RGB", (1,1), "white")
@@ -116,41 +134,32 @@ def draw_component_row(order, alliance_map):
     d = ImageDraw.Draw(img)
     f = font(22)
 
-    # positions
     pos = {}
     for i, code in enumerate(order):
-        x = PAD + i*(SQUARE+GAP)
-        y = PAD
+        x = PAD + i*(SQUARE+GAP); y = PAD
         pos[code] = (x,y)
         d.rectangle([x, y, x+SQUARE, y+SQUARE], fill=PARTY_COLOR[code], outline="black", width=2)
         tb = d.textbbox((0,0), code, font=f); tw = tb[2]-tb[0]; th = tb[3]-tb[1]
         d.text((x + SQUARE/2 - tw/2, y + SQUARE/2 - th/2), code, font=f, fill="black")
 
-    # draw strips for adjacent pairs
     f_small = font(18)
     for i in range(n-1):
         a = order[i]; b = order[i+1]
         fs = frozenset({a,b})
         idxs = alliance_map.get(fs, [])
-        if not idxs:
-            continue
+        if not idxs: continue
         x_a, y = pos[a]
-        # midpoint between squares
         mx = x_a + SQUARE + GAP/2
         my = y + SQUARE/2
-        x0 = mx - STRIP_LEN/2
-        y0 = my - STRIP_THK/2
-        x1 = mx + STRIP_LEN/2
-        y1 = my + STRIP_THK/2
+        x0 = mx - STRIP_LEN/2; y0 = my - STRIP_THK/2
+        x1 = mx + STRIP_LEN/2; y1 = my + STRIP_THK/2
         d.rectangle([x0, y0, x1, y1], fill="white", outline="black")
         text = ",".join(str(i) for i in sorted(idxs))
         tb = d.textbbox((0,0), text, font=f_small); tw = tb[2]-tb[0]; th = tb[3]-tb[1]
-        d.text(( (x0+x1)/2 - tw/2, (y0+y1)/2 - th/2 ), text, font=f_small, fill="black")
-
+        d.text(((x0+x1)/2 - tw/2, (y0+y1)/2 - th/2), text, font=f_small, fill="black")
     return img
 
 def compose_components_image(components, adj, alliance_map):
-    """Stack each component row vertically with spacing. Only involved parties are drawn."""
     rows = []
     for comp in components:
         order = linearize_component(comp, adj)
@@ -159,7 +168,6 @@ def compose_components_image(components, adj, alliance_map):
     if not rows:
         return Image.new("RGB", (600, 100), "white")
 
-    # stack vertically
     gap_v = 20
     width = max(r.width for r in rows)
     height = sum(r.height for r in rows) + gap_v*(len(rows)-1)
@@ -176,7 +184,6 @@ def compose_components_image(components, adj, alliance_map):
 st.set_page_config(page_title="Alliance Map", layout="centered")
 st.title("Alliance Map")
 
-# Controls
 col1, col2 = st.columns(2)
 with col1:
     p1 = st.selectbox("Party 1", ["Choose Party"] + PARTY_CODES, key="p1")
@@ -215,7 +222,7 @@ with c2:
 st.subheader("Party palette (reference)")
 st.image(draw_palette_row(), use_column_width=False)
 
-# Build alliances graph
+# Build alliances graph (only pairs that have any indices)
 edges = {fs for fs, idxs in st.session_state.alliances.items() if idxs}
 components, adj = connected_components(edges)
 
@@ -226,7 +233,6 @@ else:
     alliance_img = compose_components_image(components, adj, st.session_state.alliances)
     st.image(alliance_img, caption="Current alliances", use_column_width=False)
 
-# Sidebar
 with st.sidebar:
     st.header("Alliances (by pair)")
     if not edges:
